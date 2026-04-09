@@ -1,6 +1,6 @@
 # IDS_sniffer
 
-`IDS_sniffer` is a Linux network packets sniffer written in C language based on libpcap. 
+`IDS_sniffer` is a Linux network packets sniffer/Detect system written in C language based on libpcap. 
 
 ## Goals
 
