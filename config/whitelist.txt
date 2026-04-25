@@ -1,0 +1,7 @@
+# IFIRE IP Whitelist
+# IPs listed here will NEVER be blocked, even if an attack is detected.
+# Add one IPv4 address per line.
+#
+# Example (your gateway / management IP):
+# 192.168.1.1
+# 10.0.0.1

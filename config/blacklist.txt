@@ -1,0 +1,6 @@
+# IFIRE IP Blacklist
+# Add one IPv4 address per line.
+# Lines starting with # are ignored.
+#
+# Example:
+# 192.168.1.100
