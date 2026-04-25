@@ -59,7 +59,7 @@ void process_tcpsegment(ippacket *i, tcpsessiontracker tracker) {
     }
 
     if (t != NULL && session_id != NULL) {
-        if (t->getState(t) != t->trackState(tcp, src, dst, true, t)) {
+        if (t->getState(t) != t->trackState(tcp, src, dst, false, t)) {
             if (t->terminated(t)) {
                 printf("Total data exchanged between %s and %s = %d bytes.\n",
                        src, dst, t->getBytes(t));
