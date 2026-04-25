@@ -138,15 +138,19 @@ void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *pac
                 printf("----- ICMP -----\n");
                 icmp->print_icmppacket(icmp);
             }
-            if ((detect_flags & DETECT_PINGFLOOD) &&
-                    pingFloods->process_ping(i->destination_ip(i), icmp, pingFloods)) {
-                char *src = ip_str(i->source_ip(i));
-                char *dst = ip_str(i->destination_ip(i));
-                char msg[128];
-                snprintf(msg, sizeof(msg), "Ping flood targeting %s", dst);
-                alert("PING_FLOOD", src, dst, 0, 0, msg);
-                maybe_block(src, "ping flood");
-                free(src); free(dst);
+            if (detect_flags & DETECT_PINGFLOOD) {
+                ipaddress *dest_addr = i->destination_ip(i);
+                bool flood = pingFloods->process_ping(dest_addr, icmp, pingFloods);
+                free(dest_addr);
+                if (flood) {
+                    char *src = ip_str(i->source_ip(i));
+                    char *dst = ip_str(i->destination_ip(i));
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "Ping flood targeting %s", dst);
+                    alert("PING_FLOOD", src, dst, 0, 0, msg);
+                    maybe_block(src, "ping flood");
+                    free(src); free(dst);
+                }
             }
             free(icmp);
         }
@@ -312,10 +316,17 @@ static void shutdown_ifire(int code) {
     exit(code);
 }
 
+static volatile int sigint_count = 0;
+
 static void handle_sigint(int sig) {
     (void)sig;
-    printf("\n[IFIRE] Interrupted by user.\n");
-    shutdown_ifire(0);
+    sigint_count++;
+    if (sigint_count == 1) {
+        printf("\n[IFIRE] Press Ctrl+C again to stop.\n");
+    } else {
+        printf("\n[IFIRE] Stopping...\n");
+        shutdown_ifire(0);
+    }
 }
 
 /* ── device auto-detect ───────────────────────────────────────────────────── */

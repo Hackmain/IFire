@@ -37,29 +37,27 @@ bool process_ping(ipaddress *target, icmppacket *icmp, pingflooddetector detecto
     if (!keyExist(target_ip, detector->pingFloods)) {
         // It's a new target ip so initialize ping data for it
         pingrequestdata d = new_pingrequestdata(0, 0, time_arrival);
-        put(target_ip, (void*)d, detector->pingFloods);
+        detector->pingFloods = put(target_ip, (void*)d, detector->pingFloods);
+        free(target_ip);
         return false;
     }
-    
+
     // Update ping data for this target ip
     pingrequestdata d = retrieve(target_ip, detector->pingFloods);
     d->count_ip         += 1;
     d->sum_delays       += time_arrival - d->time_last_arrival;
     d->time_last_arrival = time_arrival;
-    // printf("IP address %s ping %d times.\n", target_ip, d->count_ip);
-    
+
     // compute the mean packet inter arrival time for this target
     double mean_time = 1.0 * d->sum_delays / d->count_ip;
 
-    // Is it an attack? If so, delete data for target (to prevent consider the next
-    // ping request as a new attack) and return true to flag the attack
-    
-    bool attack = (d->count_ip >= tol_count) && (mean_time < tol_delay); 
+    bool attack = (d->count_ip >= tol_count) && (mean_time < tol_delay);
 
     if (attack) {
-        removeKey(target_ip, detector->pingFloods);
+        detector->pingFloods = removeKey(target_ip, detector->pingFloods);
     }
 
+    free(target_ip);
     return attack;
 }
 
