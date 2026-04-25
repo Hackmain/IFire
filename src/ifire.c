@@ -125,6 +125,15 @@ void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *pac
     case et_IPv4: {
         ippacket *i = e->create_ippacket(e);
         if (!i) break;
+
+        /* Skip packets where the IP header fills or exceeds the captured data —
+           sub-protocol structs would have NULL p_data and crash on field access. */
+        if (!i->p_data || !i->data(i)) { free(i); break; }
+
+        /* Only process packets that claim to be IPv4 to avoid exit(FAILURE)
+           inside source_ip/destination_ip when version != 4. */
+        if (i->version(i) != 4) { free(i); break; }
+
         if (!quiet_mode) {
             printf("-------- IP packet --------\n");
             i->print_ippacket(i);
@@ -240,6 +249,14 @@ void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *pac
     case et_ARP: {
         arppacket *a = e->create_arppacket(e);
         if (!a) break;
+
+        /* Skip non-Ethernet / non-IPv4 ARP — their source_ip/destination_ip
+           call exit(FAILURE) on unknown hardware/protocol type. */
+        if (a->hardware_type(a) != aht_Ethernet ||
+            a->protocol_type(a) != apt_IPv4) {
+            free(a); break;
+        }
+
         if (!quiet_mode) {
             printf("--------- ARP ---------\n");
             a->print_arppacket(a);
@@ -255,11 +272,16 @@ void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *pac
             case akt_ArpReply: {
                 char *src = ip_str(a->source_ip(a));
                 if (arpRequests->find(src, arpRequests) == -1) {
+                    macaddress *smac = a->source_mac(a);
+                    macaddress *dmac = a->destination_mac(a);
+                    char *smac_s = get_macaddress(smac);
+                    char *dmac_s = get_macaddress(dmac);
                     char msg[160];
                     snprintf(msg, sizeof(msg),
                              "Unsolicited ARP reply from %s to %s",
-                             get_macaddress(a->source_mac(a)),
-                             get_macaddress(a->destination_mac(a)));
+                             smac_s, dmac_s);
+                    free(smac); free(dmac);
+                    free(smac_s); free(dmac_s);
                     alert("ARP_SPOOF", src, "", 0, 0, msg);
                 } else {
                     arpRequests->removeElement(src, arpRequests);
