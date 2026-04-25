@@ -5,9 +5,12 @@ SRC = $(filter-out $(SRC_DIR)/sniffer.c, $(wildcard $(SRC_DIR)/*.c))
 OBJ = $(SRC:.c=.o)
 
 CC      = cc
-CFLAGS  = -Wall -Wextra -g -I$(SRC_DIR)
+CFLAGS  = -Wall -Wextra -g -I$(SRC_DIR) -MMD -MP
 LIBS    = -lpcap
 LDFLAGS =
+
+DEPS = $(OBJ:.o=.d)
+-include $(DEPS)
 
 .PHONY: all clean debug install
 
@@ -26,4 +29,4 @@ install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/$(TARGET)
 
 clean:
-	rm -f $(SRC_DIR)/*.o $(TARGET)
+	rm -f $(SRC_DIR)/*.o $(SRC_DIR)/*.d $(TARGET)

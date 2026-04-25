@@ -10,6 +10,7 @@ typedef enum {
 
 void logger_init(const char *path);
 void logger_close(void);
+int  logger_has_file(void);
 void log_event(log_level_t level, const char *type,
                const char *src_ip, const char *dst_ip,
                int src_port, int dst_port, const char *details);

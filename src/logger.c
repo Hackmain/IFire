@@ -15,6 +15,8 @@ void logger_init(const char *path) {
     }
 }
 
+int logger_has_file(void) { return log_fp != NULL; }
+
 void logger_close(void) {
     if (log_fp) {
         fclose(log_fp);

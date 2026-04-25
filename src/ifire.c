@@ -89,6 +89,16 @@ static void alert(const char *type, const char *src_ip, const char *dst_ip,
     log_event(LOG_ALERT, type, src_ip, dst_ip, sport, dport, msg);
 }
 
+/* ── helpers ──────────────────────────────────────────────────────────────── */
+
+/* Return a heap-allocated IP string and free the ipaddress object. */
+static char *ip_str(ipaddress *addr) {
+    if (!addr) return strdup("?");
+    char *s = get_ipaddress(addr);
+    free(addr);
+    return s ? s : strdup("?");
+}
+
 /* ── packet processor ─────────────────────────────────────────────────────── */
 void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *packet) {
     if (!quiet_mode)
@@ -97,10 +107,13 @@ void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *pac
                (int)(100.0 * h->caplen / h->len),
                ctime((const time_t*)&h->ts.tv_sec));
 
-    datagram *d = new_datagram(packet, h->caplen);
+    datagram *d = new_datagram((unsigned char *)packet, h->caplen);
+    if (!d) { capture_count++; return; }
+
     if (show_raw && !quiet_mode) d->print_datagram(d);
 
     ethernetframe *e = d->create_ethernetframe(d);
+    if (!e) { free(d); capture_count++; return; }
     if (!quiet_mode) {
         printf("---------- Ethernet frame ----------\n");
         e->print_ethernetframe(e);
@@ -111,102 +124,108 @@ void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *pac
 
     case et_IPv4: {
         ippacket *i = e->create_ippacket(e);
+        if (!i) break;
         if (!quiet_mode) {
             printf("-------- IP packet --------\n");
             i->print_ippacket(i);
         }
 
-        const char *src_ip = get_ipaddress(i->source_ip(i));
-        const char *dst_ip = get_ipaddress(i->destination_ip(i));
-
-        /* Skip packets from blocked IPs (IPS mode) */
-        if (ips_mode && fw && firewall_is_blocked(fw, src_ip)) {
-            log_event(LOG_INFO, "DROPPED", src_ip, dst_ip, 0, 0, "blocked IP");
-            free(i);
-            break;
-        }
-
         /* ── ICMP / Ping flood ─────────────────────────────────────────── */
         if (i->protocol(i) == ipp_icmp) {
             icmppacket *icmp = i->create_icmppacket(i);
+            if (!icmp) { free(i); break; }
             if (!quiet_mode) {
                 printf("----- ICMP -----\n");
                 icmp->print_icmppacket(icmp);
             }
-
             if ((detect_flags & DETECT_PINGFLOOD) &&
-                pingFloods->process_ping(i->destination_ip(i), icmp, pingFloods)) {
+                    pingFloods->process_ping(i->destination_ip(i), icmp, pingFloods)) {
+                char *src = ip_str(i->source_ip(i));
+                char *dst = ip_str(i->destination_ip(i));
                 char msg[128];
-                snprintf(msg, sizeof(msg),
-                         "Ping flood: large echo requests targeting %s", dst_ip);
-                alert("PING_FLOOD", src_ip, dst_ip, 0, 0, msg);
-                maybe_block(src_ip, "ping flood");
+                snprintf(msg, sizeof(msg), "Ping flood targeting %s", dst);
+                alert("PING_FLOOD", src, dst, 0, 0, msg);
+                maybe_block(src, "ping flood");
+                free(src); free(dst);
             }
-
-            log_event(LOG_INFO, "ICMP", src_ip, dst_ip, 0, 0, "icmp packet");
             free(icmp);
         }
 
         /* ── TCP ─────────────────────────────────────────────────────────── */
         else if (i->protocol(i) == ipp_tcp) {
             tcpsegment *tcp = i->create_tcpsegment(i);
+            if (!tcp) { free(i); break; }
             if (!quiet_mode) {
                 printf("----- TCP -----\n");
                 tcp->print_tcpsegment(tcp);
             }
-
             int sport = (int)tcp->source_port(tcp);
             int dport = (int)tcp->destination_port(tcp);
-            bool syn = tcp->flag_syn(tcp);
-            bool ack = tcp->flag_ack(tcp);
+            bool syn  = tcp->flag_syn(tcp);
+            bool ack  = tcp->flag_ack(tcp);
 
-            /* TCP session tracker */
             if (detect_flags & DETECT_TCPTRACK)
                 tcpSessions->process_tcpsegment(i, tcpSessions);
 
-            /* Port scan detector (SYN packets only) */
             if ((detect_flags & DETECT_PORTSCAN) && syn && !ack) {
-                if (portscan_process(src_ip, (unsigned int)dport, portscanner)) {
+                char *src = ip_str(i->source_ip(i));
+                if (portscan_process(src, (unsigned int)dport, portscanner)) {
+                    char *dst = ip_str(i->destination_ip(i));
                     char msg[128];
                     snprintf(msg, sizeof(msg),
-                             "Port scan: %u+ unique ports probed from %s",
-                             portscanner->port_threshold, src_ip);
-                    alert("PORT_SCAN", src_ip, dst_ip, sport, dport, msg);
-                    maybe_block(src_ip, "port scan");
+                             "Port scan: %u+ unique ports from %s",
+                             portscanner->port_threshold, src);
+                    alert("PORT_SCAN", src, dst, sport, dport, msg);
+                    maybe_block(src, "port scan");
+                    free(dst);
                 }
+                free(src);
             }
 
-            /* SYN flood detector */
             if (detect_flags & DETECT_SYNFLOOD) {
-                if (synflood_process(dst_ip, syn, ack, synflooder)) {
+                char *dst = ip_str(i->destination_ip(i));
+                if (synflood_process(dst, syn, ack, synflooder)) {
+                    char *src = ip_str(i->source_ip(i));
                     char msg[128];
                     snprintf(msg, sizeof(msg),
-                             "SYN flood: %u+ SYNs with low ACK ratio targeting %s",
-                             synflooder->syn_threshold, dst_ip);
-                    alert("SYN_FLOOD", src_ip, dst_ip, sport, dport, msg);
-                    maybe_block(src_ip, "SYN flood");
+                             "SYN flood: %u+ SYNs targeting %s",
+                             synflooder->syn_threshold, dst);
+                    alert("SYN_FLOOD", src, dst, sport, dport, msg);
+                    maybe_block(src, "SYN flood");
+                    free(src);
                 }
+                free(dst);
             }
 
-            log_event(LOG_INFO, "TCP", src_ip, dst_ip, sport, dport, "tcp segment");
+            if (logger_has_file()) {
+                char *src = ip_str(i->source_ip(i));
+                char *dst = ip_str(i->destination_ip(i));
+                log_event(LOG_INFO, "TCP", src, dst, sport, dport, "");
+                free(src); free(dst);
+            }
             free(tcp);
         }
 
         /* ── UDP ─────────────────────────────────────────────────────────── */
         else if (i->protocol(i) == ipp_udp) {
             udpsegment *udp = i->create_udpsegment(i);
+            if (!udp) { free(i); break; }
             if (!quiet_mode) {
                 printf("----- UDP -----\n");
                 udp->print_udpsegment(udp);
             }
-
             int sport = (int)udp->source_port(udp);
             int dport = (int)udp->destination_port(udp);
 
             if ((detect_flags & DETECT_TFTPTRACK) && tftpserver)
                 tftpSessions->process_tftpmessage(i, tftpserver, tftpSessions);
 
-            log_event(LOG_INFO, "UDP", src_ip, dst_ip, sport, dport, "udp segment");
+            if (logger_has_file()) {
+                char *src = ip_str(i->source_ip(i));
+                char *dst = ip_str(i->destination_ip(i));
+                log_event(LOG_INFO, "UDP", src, dst, sport, dport, "");
+                free(src); free(dst);
+            }
             free(udp);
         }
 
@@ -216,33 +235,35 @@ void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *pac
 
     case et_ARP: {
         arppacket *a = e->create_arppacket(e);
+        if (!a) break;
         if (!quiet_mode) {
             printf("--------- ARP ---------\n");
             a->print_arppacket(a);
         }
-
         if (detect_flags & DETECT_ARPSPOOF) {
             switch (a->operation(a)) {
-            case akt_ArpRequest:
-                arpRequests->add(get_ipaddress(a->destination_ip(a)), arpRequests);
+            case akt_ArpRequest: {
+                char *dst = ip_str(a->destination_ip(a));
+                arpRequests->add(dst, arpRequests);
+                free(dst);
                 break;
-            case akt_ArpReply:
-                if (arpRequests->find(get_ipaddress(a->source_ip(a)), arpRequests) == -1) {
-                    const char *attacker_mac = get_macaddress(a->source_mac(a));
-                    const char *victim_mac   = get_macaddress(a->destination_mac(a));
+            }
+            case akt_ArpReply: {
+                char *src = ip_str(a->source_ip(a));
+                if (arpRequests->find(src, arpRequests) == -1) {
                     char msg[160];
                     snprintf(msg, sizeof(msg),
                              "Unsolicited ARP reply from %s to %s",
-                             attacker_mac, victim_mac);
-                    alert("ARP_SPOOF", "", "", 0, 0, msg);
-                    log_event(LOG_ALERT, "ARP_SPOOF", "", "", 0, 0, msg);
+                             get_macaddress(a->source_mac(a)),
+                             get_macaddress(a->destination_mac(a)));
+                    alert("ARP_SPOOF", src, "", 0, 0, msg);
                 } else {
-                    arpRequests->removeElement(
-                        get_ipaddress(a->source_ip(a)), arpRequests);
+                    arpRequests->removeElement(src, arpRequests);
                 }
+                free(src);
                 break;
-            default:
-                break;
+            }
+            default: break;
             }
         }
         free(a);

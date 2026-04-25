@@ -16,8 +16,8 @@ char* get_ipaddress(ipaddress *i) {
     char *ip = malloc(sizeof(char)*20);
     ip[0] = 0; // malloc doesn't initialize the memory
     for(unsigned int n = 0; n < i->p_int; n++) {
-        char s[3];
-        sprintf(s, "%d", i->p_data[n]);
+        char s[4];
+        snprintf(s, sizeof(s), "%d", i->p_data[n]);
         strcat(ip, s);
         if (n < i->p_int - 1) {
             strcat(ip, ".");
