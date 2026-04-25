@@ -30,6 +30,7 @@
 #include "firewall.h"
 #include "portscan.h"
 #include "synflood.h"
+#include "portflood.h"
 #include "logger.h"
 
 /* ── global state ─────────────────────────────────────────────────────────── */
@@ -53,6 +54,9 @@ static tcpsessiontracker    tcpSessions  = NULL;
 static tftpsessiontracker   tftpSessions = NULL;
 static portscan_detector_t  portscanner  = NULL;
 static synflood_detector_t  synflooder   = NULL;
+static portflood_detector_t ssh_detector  = NULL;
+static portflood_detector_t rdp_detector  = NULL;
+static portflood_detector_t http_detector = NULL;
 static firewall_t           fw           = NULL;
 
 /* ── banner ───────────────────────────────────────────────────────────────── */
@@ -210,6 +214,70 @@ void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_char *pac
                 free(dst);
             }
 
+            /* ── SSH / RDP / HTTP brute force ───────────────────────────── */
+            if ((detect_flags & (DETECT_SSHBRUTE|DETECT_RDPBRUTE|DETECT_HTTPFLOOD))
+                    && syn && !ack) {
+                char *src = ip_str(i->source_ip(i));
+                if ((detect_flags & DETECT_SSHBRUTE) &&
+                        portflood_process(src, (unsigned int)dport, syn, ssh_detector)) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "SSH brute force: %u+ attempts from %s",
+                             ssh_detector->threshold, src);
+                    alert("SSH_BRUTE", src, "", sport, 22, msg);
+                    maybe_block(src, "SSH brute force");
+                }
+                if ((detect_flags & DETECT_RDPBRUTE) &&
+                        portflood_process(src, (unsigned int)dport, syn, rdp_detector)) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "RDP brute force: %u+ attempts from %s",
+                             rdp_detector->threshold, src);
+                    alert("RDP_BRUTE", src, "", sport, 3389, msg);
+                    maybe_block(src, "RDP brute force");
+                }
+                if ((detect_flags & DETECT_HTTPFLOOD) &&
+                        portflood_process(src, (unsigned int)dport, syn, http_detector)) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "HTTP flood: %u+ connections from %s",
+                             http_detector->threshold, src);
+                    alert("HTTP_FLOOD", src, "", sport, 80, msg);
+                    maybe_block(src, "HTTP flood");
+                }
+                free(src);
+            }
+
+            /* ── Stealth scans (NULL / FIN / XMAS) ─────────────────────── */
+            if (detect_flags & DETECT_STEALTHSCAN) {
+                bool fin = tcp->flag_fin(tcp);
+                bool psh = tcp->flag_psh(tcp);
+                bool urg = tcp->flag_urg(tcp);
+                bool rst = tcp->flag_rst(tcp);
+                if (!syn && !ack && !fin && !psh && !urg && !rst) {
+                    char *src = ip_str(i->source_ip(i));
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "NULL scan from %s to port %d", src, dport);
+                    alert("NULL_SCAN", src, "", sport, dport, msg);
+                    maybe_block(src, "NULL scan");
+                    free(src);
+                } else if (fin && !syn && !ack && !psh && !urg && !rst) {
+                    char *src = ip_str(i->source_ip(i));
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "FIN scan from %s to port %d", src, dport);
+                    alert("FIN_SCAN", src, "", sport, dport, msg);
+                    maybe_block(src, "FIN scan");
+                    free(src);
+                } else if (fin && psh && urg) {
+                    char *src = ip_str(i->source_ip(i));
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "XMAS scan from %s to port %d", src, dport);
+                    alert("XMAS_SCAN", src, "", sport, dport, msg);
+                    maybe_block(src, "XMAS scan");
+                    free(src);
+                }
+            }
+
             if (logger_has_file()) {
                 char *src = ip_str(i->source_ip(i));
                 char *dst = ip_str(i->destination_ip(i));
@@ -314,9 +382,12 @@ static void init_detectors(void) {
     newPingFloodDetector(&pingFloods);
     newTCPSessionTracker(&tcpSessions);
     newTFTPSessionTracker(&tftpSessions);
-    portscanner = portscan_new(15, 5000);   /* 15 unique ports / 5 s  */
-    synflooder  = synflood_new(100, 5.0f, 10000); /* 100 SYNs, ratio 5, 10 s */
-    fw          = firewall_new(ips_mode);
+    portscanner  = portscan_new(15, 5000);
+    synflooder   = synflood_new(100, 5.0f, 10000);
+    ssh_detector  = portflood_new(22,   10,  60000); /* 10 SYNs to port 22 / 60 s  */
+    rdp_detector  = portflood_new(3389, 5,   30000); /* 5 SYNs to port 3389 / 30 s */
+    http_detector = portflood_new(80,   200, 10000); /* 200 SYNs to port 80 / 10 s */
+    fw           = firewall_new(ips_mode);
 }
 
 static void shutdown_ifire(int code) {
@@ -327,6 +398,9 @@ static void shutdown_ifire(int code) {
     destroy_tftpsessiontracker(tftpSessions);
     portscan_destroy(portscanner);
     synflood_destroy(synflooder);
+    portflood_destroy(ssh_detector);
+    portflood_destroy(rdp_detector);
+    portflood_destroy(http_detector);
     firewall_destroy(fw);
 
     if (pcap_log)  pcap_dump_close(pcap_log);
@@ -378,14 +452,18 @@ static void print_usage(const char *prog) {
     printf("    -l <file>   Write captured packets to pcap file\n");
     printf("    -j <file>   Write JSON event log to file\n\n");
     printf("  Detection (-s <mode>, repeatable)\n");
-    printf("    -s arpspoof   ARP spoofing detection\n");
-    printf("    -s pingflood  Ping flood detection\n");
-    printf("    -s portscan   Port scan detection\n");
-    printf("    -s synflood   SYN flood detection\n");
-    printf("    -s tcptrack   TCP session tracking\n");
-    printf("    -s tftptrack  TFTP session tracking\n");
-    printf("    -s all        All detections (default)\n");
-    printf("    -S <ip>       TFTP server IP to monitor\n\n");
+    printf("    -s arpspoof     ARP spoofing detection\n");
+    printf("    -s pingflood    Ping flood detection\n");
+    printf("    -s portscan     Port scan detection\n");
+    printf("    -s synflood     SYN flood detection\n");
+    printf("    -s tcptrack     TCP session tracking\n");
+    printf("    -s tftptrack    TFTP session tracking\n");
+    printf("    -s sshbrute     SSH brute force detection\n");
+    printf("    -s rdpbrute     RDP brute force detection\n");
+    printf("    -s httpflood    HTTP connection flood detection\n");
+    printf("    -s stealthscan  NULL/FIN/XMAS scan detection\n");
+    printf("    -s all          All detections (default)\n");
+    printf("    -S <ip>         TFTP server IP to monitor\n\n");
     printf("  IPS / Firewall\n");
     printf("    -B            Enable IPS blocking mode (requires root)\n");
     printf("    -b <file>     Load IP blacklist from file\n");
@@ -456,6 +534,14 @@ int main(int argc, char *argv[]) {
                 detect_flags |= DETECT_PORTSCAN;
             } else if (!strcmp(optarg, "synflood")) {
                 detect_flags |= DETECT_SYNFLOOD;
+            } else if (!strcmp(optarg, "sshbrute")) {
+                detect_flags |= DETECT_SSHBRUTE;
+            } else if (!strcmp(optarg, "rdpbrute")) {
+                detect_flags |= DETECT_RDPBRUTE;
+            } else if (!strcmp(optarg, "httpflood")) {
+                detect_flags |= DETECT_HTTPFLOOD;
+            } else if (!strcmp(optarg, "stealthscan")) {
+                detect_flags |= DETECT_STEALTHSCAN;
             } else {
                 fprintf(stderr, "[IFIRE] Unknown detection mode: %s\n", optarg);
                 return -1;
@@ -575,12 +661,16 @@ int main(int argc, char *argv[]) {
 
     /* Print active detection modes */
     printf("[IFIRE] Detection:");
-    if (detect_flags & DETECT_ARPSPOOF)  printf(" ARP-spoof");
-    if (detect_flags & DETECT_PINGFLOOD) printf(" Ping-flood");
-    if (detect_flags & DETECT_PORTSCAN)  printf(" Port-scan");
-    if (detect_flags & DETECT_SYNFLOOD)  printf(" SYN-flood");
-    if (detect_flags & DETECT_TCPTRACK)  printf(" TCP-track");
-    if (detect_flags & DETECT_TFTPTRACK) printf(" TFTP-track");
+    if (detect_flags & DETECT_ARPSPOOF)    printf(" ARP-spoof");
+    if (detect_flags & DETECT_PINGFLOOD)   printf(" Ping-flood");
+    if (detect_flags & DETECT_PORTSCAN)    printf(" Port-scan");
+    if (detect_flags & DETECT_SYNFLOOD)    printf(" SYN-flood");
+    if (detect_flags & DETECT_TCPTRACK)    printf(" TCP-track");
+    if (detect_flags & DETECT_TFTPTRACK)   printf(" TFTP-track");
+    if (detect_flags & DETECT_SSHBRUTE)    printf(" SSH-brute");
+    if (detect_flags & DETECT_RDPBRUTE)    printf(" RDP-brute");
+    if (detect_flags & DETECT_HTTPFLOOD)   printf(" HTTP-flood");
+    if (detect_flags & DETECT_STEALTHSCAN) printf(" Stealth-scan");
     printf("\n");
 
     if (ips_mode) printf("[IFIRE] IPS mode ENABLED - attackers will be auto-blocked\n");
