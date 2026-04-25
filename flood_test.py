@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-IFIRE Flood Tester - aggressive version
-Run as root: sudo python3 flood_test.py [target_ip]
-Start IFIRE first, then run this script.
+IFIRE Flood Tester
+Forces packets through eth0 via SO_BINDTODEVICE so IFIRE captures them.
+Usage: sudo python3 flood_test.py [target_ip] [interface]
 """
 
 import socket
@@ -12,8 +12,12 @@ import time
 import sys
 import os
 import threading
+import subprocess
 
 TARGET = sys.argv[1] if len(sys.argv) > 1 else "192.168.17.211"
+IFACE  = sys.argv[2] if len(sys.argv) > 2 else "eth0"
+
+SO_BINDTODEVICE = 25   # Linux constant
 
 # ── packet builders ────────────────────────────────────────────────────────────
 
@@ -54,8 +58,12 @@ def make_icmp(size=1200):
     return struct.pack("!BBHHH", 8, 0, csum, ident, seq) + pay
 
 def raw_sock():
+    """Raw socket bound to IFACE so packets appear on that interface."""
     s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
     s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    # Force packets through IFACE regardless of routing table
+    s.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE,
+                 IFACE.encode() + b'\x00')
     return s
 
 def rand_ip():
@@ -64,7 +72,7 @@ def rand_ip():
 # ── attacks ────────────────────────────────────────────────────────────────────
 
 def syn_flood():
-    print(f"[SYN FLOOD]  → {TARGET}  sending 500 SYNs (port 80) ...")
+    print(f"[SYN FLOOD]  → {TARGET}  500 SYNs to port 80 from one spoofed IP")
     s   = raw_sock()
     src = rand_ip()
     sp  = random.randint(1024, 65535)
@@ -73,10 +81,10 @@ def syn_flood():
         ip  = make_ip(src, TARGET, 6, tcp)
         s.sendto(ip + tcp, (TARGET, 0))
     s.close()
-    print(f"           done  src={src}")
+    print(f"    done  src={src}")
 
 def port_scan():
-    print(f"[PORT SCAN]  → {TARGET}  scanning 25 unique ports ...")
+    print(f"[PORT SCAN]  → {TARGET}  SYN to 25 unique ports from one spoofed IP")
     s    = raw_sock()
     src  = rand_ip()
     sp   = random.randint(1024, 65535)
@@ -85,31 +93,33 @@ def port_scan():
         tcp = make_syn(src, TARGET, sp, dp)
         ip  = make_ip(src, TARGET, 6, tcp)
         s.sendto(ip + tcp, (TARGET, 0))
-        time.sleep(0.05)          # 25 ports in ~1.25 s → well inside 5 s window
+        time.sleep(0.05)
     s.close()
-    print(f"           done  src={src}  ports={ports[:5]}...")
+    print(f"    done  src={src}")
 
 def ping_flood():
-    print(f"[PING FLOOD] → {TARGET}  sending 120 large ICMP (1200 B) ...")
+    print(f"[PING FLOOD] → {TARGET}  120 × 1200-byte ICMP from one spoofed IP")
     s   = raw_sock()
     src = rand_ip()
     pkt = make_icmp(1200)
     ip  = make_ip(src, TARGET, 1, pkt)
     for _ in range(120):
         s.sendto(ip + pkt, (TARGET, 0))
-        time.sleep(0.04)          # 40 ms apart → mean < 200 ms threshold
+        time.sleep(0.04)
     s.close()
-    print(f"           done  src={src}")
+    print(f"    done  src={src}")
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if os.geteuid() != 0:
-        print("Run as root:  sudo python3 flood_test.py [target_ip]")
+        print("Run as root:  sudo python3 flood_test.py [target_ip] [interface]")
         sys.exit(1)
 
-    print(f"\n  IFIRE Flood Tester  —  target: {TARGET}")
-    print(f"  Make sure IFIRE is running:  sudo ./ifire -d eth0 -q\n")
+    print(f"\n  IFIRE Flood Tester")
+    print(f"  target   : {TARGET}")
+    print(f"  interface: {IFACE}  (packets forced through this device)")
+    print(f"  Make sure IFIRE is running:  sudo ./ifire -d {IFACE} -q\n")
 
     for i in range(3, 0, -1):
         print(f"  Starting in {i}...", end="\r", flush=True)
@@ -117,15 +127,14 @@ if __name__ == "__main__":
     print("  Launching attacks now!       ")
     print()
 
-    # Run all three attacks in parallel so they overlap within their windows
     threads = [
-        threading.Thread(target=syn_flood),
-        threading.Thread(target=port_scan),
-        threading.Thread(target=ping_flood),
+        threading.Thread(target=syn_flood,  name="syn"),
+        threading.Thread(target=port_scan,  name="scan"),
+        threading.Thread(target=ping_flood, name="ping"),
     ]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
-    print("\n  All done. Watch IFIRE for ALERT lines.")
+    print("\n  Done. IFIRE should show PORT_SCAN, SYN_FLOOD, and PING_FLOOD alerts.")
